@@ -1,0 +1,9 @@
+streamlit>=1.36.0
+supabase>=2.6.0
+python-dotenv>=1.0.1
+pydantic>=2.7.0
+openai>=1.40.0
+pypdf>=4.2.0
+pandas>=2.2.2
+openpyxl>=3.1.5
+xlrd>=2.0.1
