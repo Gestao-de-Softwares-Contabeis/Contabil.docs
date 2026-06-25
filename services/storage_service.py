@@ -65,6 +65,20 @@ class SupabaseStorageService:
             )
             raise
 
+    def delete_object(self, storage_path: str) -> bool:
+        normalized_path = storage_path.strip().lstrip("/")
+        if not normalized_path:
+            return False
+        try:
+            self.client.storage.from_(self.bucket).remove([normalized_path])
+            return True
+        except Exception:
+            logger.exception(
+                "Erro ao remover arquivo do Supabase Storage",
+                extra={"ctx_bucket": self.bucket, "ctx_storage_path": normalized_path},
+            )
+            return False
+
     def build_storage_path(self, document: UploadedDocument) -> str:
         safe_name = sanitize_filename_part(document.original_filename, "documento")
         hash_prefix = document.file_hash[:12] if document.file_hash else "sem_hash"

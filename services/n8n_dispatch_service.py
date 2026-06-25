@@ -4,7 +4,7 @@ import json
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from app.settings import load_settings
+from app.settings import get_n8n_webhook_debug_info, get_n8n_webhook_url, load_settings
 from models.document import CoreDocumentResult, UploadedDocument
 from models.integration import N8NDispatchResult, StorageUploadResult
 from services.storage_service import SupabaseStorageService
@@ -23,33 +23,24 @@ class N8NDispatchService:
     ) -> None:
         settings = load_settings()
         self.storage_service = storage_service
-        self.webhook_url = webhook_url if webhook_url is not None else settings.n8n_webhook_url
+        self.webhook_url = webhook_url
         self.timeout_seconds = timeout_seconds or settings.n8n_timeout_seconds
 
     def dispatch(self, document: UploadedDocument, result: CoreDocumentResult) -> N8NDispatchResult:
-        if not self.webhook_url:
+        try:
+            webhook_url = self._webhook_url()
+            webhook_debug = self._webhook_debug_info()
+        except ValueError as exc:
             return N8NDispatchResult(
                 send_ok=False,
                 skipped=True,
-                error="Webhook n8n nao configurado. Defina N8N_WEBHOOK_URL ou N8N_TEST_WEBHOOK_URL no .env.",
+                error=str(exc),
             )
 
         try:
             storage_service = self.storage_service or SupabaseStorageService()
             storage = storage_service.upload_and_sign(document)
-            payload = self.build_payload(result, storage)
-            response = self._post(payload)
-            return N8NDispatchResult(
-                send_ok=200 <= int(response["status_code"]) < 300,
-                bucket=storage.bucket,
-                storage_path=storage.storage_path,
-                new_file_name=result.new_file_name,
-                destination_folder_id=result.destination_folder_id,
-                signed_url=storage.signed_url,
-                n8n_status_code=int(response["status_code"]),
-                n8n_response_body=str(response["response_body"]),
-                payload=payload,
-            )
+            return self.dispatch_analyzed(result, storage, webhook_url=webhook_url, webhook_debug=webhook_debug)
         except HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
             logger.exception(
@@ -64,6 +55,65 @@ class N8NDispatchService:
         except (URLError, Exception) as exc:
             logger.exception("Erro ao enviar documento para n8n", extra={"ctx_file": result.original_file_name})
             return N8NDispatchResult(send_ok=False, error=str(exc))
+
+    def dispatch_analyzed(
+        self,
+        result: CoreDocumentResult,
+        storage: StorageUploadResult | None = None,
+        webhook_url: str | None = None,
+        webhook_debug: dict[str, str] | None = None,
+    ) -> N8NDispatchResult:
+        try:
+            selected_webhook_url = webhook_url or self._webhook_url()
+            selected_webhook_debug = webhook_debug or self._webhook_debug_info()
+        except ValueError as exc:
+            return N8NDispatchResult(
+                send_ok=False,
+                skipped=True,
+                error=str(exc),
+            )
+
+        payload: dict[str, object] = {}
+        try:
+            storage_data = storage or StorageUploadResult.model_validate(result.storage_upload)
+            payload = self.build_payload(result, storage_data)
+            response = self._post(payload, selected_webhook_url)
+            return N8NDispatchResult(
+                send_ok=200 <= int(response["status_code"]) < 300,
+                bucket=storage_data.bucket,
+                storage_path=storage_data.storage_path,
+                new_file_name=result.new_file_name,
+                destination_folder_id=result.destination_folder_id,
+                signed_url=storage_data.signed_url,
+                n8n_status_code=int(response["status_code"]),
+                n8n_response_body=str(response["response_body"]),
+                payload=payload,
+                webhook_variable=selected_webhook_debug.get("variable"),
+                webhook_endpoint=selected_webhook_debug.get("endpoint"),
+            )
+        except HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            logger.exception(
+                "Webhook n8n retornou erro HTTP",
+                extra={"ctx_status_code": exc.code, "ctx_file": result.original_file_name},
+            )
+            return N8NDispatchResult(
+                send_ok=False,
+                n8n_status_code=exc.code,
+                error=error_body or str(exc),
+                payload=payload,
+                webhook_variable=selected_webhook_debug.get("variable"),
+                webhook_endpoint=selected_webhook_debug.get("endpoint"),
+            )
+        except (URLError, Exception) as exc:
+            logger.exception("Erro ao enviar documento analisado para n8n", extra={"ctx_file": result.original_file_name})
+            return N8NDispatchResult(
+                send_ok=False,
+                error=str(exc),
+                payload=payload,
+                webhook_variable=selected_webhook_debug.get("variable"),
+                webhook_endpoint=selected_webhook_debug.get("endpoint"),
+            )
 
     def build_payload(
         self,
@@ -88,10 +138,24 @@ class N8NDispatchService:
             "confidence": result.confidence,
         }
 
-    def _post(self, payload: dict[str, object]) -> dict[str, object]:
+    def _webhook_url(self) -> str:
+        return self.webhook_url.strip() if self.webhook_url else get_n8n_webhook_url()
+
+    def _webhook_debug_info(self) -> dict[str, str]:
+        if self.webhook_url:
+            return {"variable": "argumento", "endpoint": self._safe_endpoint(self.webhook_url)}
+        return get_n8n_webhook_debug_info()
+
+    def _safe_endpoint(self, url: str) -> str:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        return f"{parsed.netloc}{parsed.path}" if parsed.netloc else parsed.path
+
+    def _post(self, payload: dict[str, object], webhook_url: str) -> dict[str, object]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = Request(
-            self.webhook_url,
+            webhook_url,
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",

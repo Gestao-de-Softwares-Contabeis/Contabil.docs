@@ -475,8 +475,8 @@ def extract_terms_candidates(filename: str, text: str) -> list[str]:
 def detect_document_type(extension: str, text: str, filename: str = "") -> DocumentType:
     normalized = normalize_text(f"{filename} {text[:5000]}")
     normalized_filename = normalize_text(filename)
-    if extension == "ofx" or "ofx" in normalized:
-        return DocumentType.OFX
+    if extension == "ofx":
+        return DocumentType.BANK_STATEMENT
     if (
         "rendimentos" in normalized
         or "renda fixa" in normalized

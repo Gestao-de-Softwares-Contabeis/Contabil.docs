@@ -143,5 +143,6 @@ class CoreDocumentResult(BaseModel):
     extracted_partner_candidates: list[str] = Field(default_factory=list)
     extracted_terms_candidates: list[str] = Field(default_factory=list)
     suggested_rule_type: str | None = None
+    storage_upload: dict[str, Any] = Field(default_factory=dict)
     n8n_dispatch: dict[str, Any] = Field(default_factory=dict)
     extracted_summary: dict[str, Any] = Field(default_factory=dict)

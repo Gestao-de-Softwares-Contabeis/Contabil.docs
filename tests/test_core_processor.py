@@ -3,8 +3,8 @@ from __future__ import annotations
 import unittest
 
 from models.client import Client, StorageRoute
-from models.document import CoreProcessingStatus
-from models.integration import N8NDispatchResult
+from models.document import CoreProcessingStatus, DocumentLogEntry
+from models.integration import N8NDispatchResult, StorageUploadResult
 from models.rule import DocumentRule
 from services.core_processor import CoreProcessor
 from services.identification_service import IdentificationService
@@ -63,26 +63,52 @@ class FakeOpenAIService:
 
 class FakeN8NDispatchService:
     def __init__(self) -> None:
-        self.calls: list[tuple[object, object]] = []
+        self.calls: list[object] = []
 
-    def dispatch(self, document: object, result: object) -> N8NDispatchResult:
-        self.calls.append((document, result))
+    def dispatch_analyzed(self, result: object, storage: StorageUploadResult | None = None) -> N8NDispatchResult:
+        self.calls.append(result)
         return N8NDispatchResult(
             send_ok=True,
-            bucket="incoming-documents",
-            storage_path="uploads/fake.pdf",
+            bucket=getattr(result, "storage_upload", {}).get("bucket", "incoming-documents"),
+            storage_path=getattr(result, "storage_upload", {}).get("storage_path", "uploads/fake.pdf"),
             new_file_name=getattr(result, "new_file_name", None),
             destination_folder_id=getattr(result, "destination_folder_id", None),
-            signed_url="https://signed.example/fake.pdf",
+            signed_url=getattr(result, "storage_upload", {}).get("signed_url", "https://signed.example/fake.pdf"),
             n8n_status_code=200,
             n8n_response_body="ok",
             payload={
-                "signed_url": "https://signed.example/fake.pdf",
-                "storage_path": "uploads/fake.pdf",
+                "signed_url": getattr(result, "storage_upload", {}).get("signed_url", "https://signed.example/fake.pdf"),
+                "storage_path": getattr(result, "storage_upload", {}).get("storage_path", "uploads/fake.pdf"),
                 "new_file_name": getattr(result, "new_file_name", None),
                 "destination_folder_id": getattr(result, "destination_folder_id", None),
             },
         )
+
+
+class FakeStorageService:
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+
+    def upload_and_sign(self, document: object, storage_path: str | None = None) -> StorageUploadResult:
+        self.calls.append(document)
+        return StorageUploadResult(
+            upload_ok=True,
+            bucket="incoming-documents",
+            storage_path=storage_path or "uploads/fake.pdf",
+            tamanho=getattr(document, "size_bytes", 0),
+            signed_url="https://signed.example/fake.pdf",
+            signed_url_ttl_seconds=600,
+            response_path=storage_path or "uploads/fake.pdf",
+        )
+
+
+class MemoryLogRepository:
+    def __init__(self) -> None:
+        self.logs: list[DocumentLogEntry] = []
+
+    def insert(self, entry: DocumentLogEntry) -> DocumentLogEntry:
+        self.logs.append(entry)
+        return entry
 
 
 def client(
@@ -115,6 +141,8 @@ def build_processor(
     rules: list[DocumentRule] | None = None,
     ai_result: dict[str, object] | None = None,
     dispatch_service: FakeN8NDispatchService | None = None,
+    storage_service: FakeStorageService | None = None,
+    log_repository: MemoryLogRepository | None = None,
 ) -> tuple[CoreProcessor, FakeOpenAIService]:
     fake_ai = FakeOpenAIService(ai_result)
     identification = IdentificationService(
@@ -127,7 +155,9 @@ def build_processor(
         CoreProcessor(
             identification_service=identification,
             routing_service=routing,
+            storage_service=storage_service or FakeStorageService(),
             n8n_dispatch_service=dispatch_service or FakeN8NDispatchService(),
+            log_repository=log_repository or MemoryLogRepository(),
         ),
         fake_ai,
     )
@@ -196,6 +226,26 @@ class CoreProcessorTest(unittest.TestCase):
         self.assertEqual(result.status, CoreProcessingStatus.READY_TO_SEND)
         self.assertEqual(result.document_type, "relatorio_financeiro")
         self.assertEqual(result.competence, "2026-05")
+
+    def test_ofx_extension_is_bank_statement_document_type(self) -> None:
+        acme = client("001", "ACME LTDA", "12345678000199")
+        processor, fake_ai = build_processor([acme], [route("001", "2026-03")])
+
+        result = processor.process_file(
+            filename="extrato_acme.ofx",
+            content=(
+                "<OFX><BANKACCTFROM><BANKID>001</BANKID><BRANCHID>0542</BRANCHID>"
+                "<ACCTID>984927</ACCTID></BANKACCTFROM>"
+                "<BANKTRANLIST><DTSTART>20260301</DTSTART><DTEND>20260331</DTEND></BANKTRANLIST>"
+                "cliente codigo 001</OFX>"
+            ).encode("utf-8"),
+            department="contabil",
+        )
+
+        self.assertEqual(result.status, CoreProcessingStatus.READY_TO_SEND)
+        self.assertEqual(result.document_type, "extrato_bancario")
+        self.assertEqual(result.competence, "2026-03")
+        self.assertEqual(fake_ai.calls, 0)
 
     def test_bank_account_rule_identifies_client(self) -> None:
         acme = client("001", "ACME LTDA")
@@ -371,13 +421,15 @@ class CoreProcessorTest(unittest.TestCase):
         self.assertEqual(result.extracted_summary["matched_by"], "manual_override")
         self.assertEqual(fake_ai.calls, 0)
 
-    def test_ready_document_is_uploaded_and_sent_to_n8n(self) -> None:
+    def test_analyze_only_ready_document_uploads_storage_but_does_not_send_to_n8n(self) -> None:
         acme = client("001", "ACME LTDA", "12345678000199")
         dispatch = FakeN8NDispatchService()
+        storage = FakeStorageService()
         processor, fake_ai = build_processor(
             [acme],
             [route("001", "2026-03")],
             dispatch_service=dispatch,
+            storage_service=storage,
         )
 
         result = processor.process_file(
@@ -390,11 +442,44 @@ class CoreProcessorTest(unittest.TestCase):
         )
 
         self.assertEqual(result.status, CoreProcessingStatus.READY_TO_SEND)
-        self.assertEqual(len(dispatch.calls), 1)
-        self.assertTrue(result.n8n_dispatch["send_ok"])
-        self.assertEqual(result.n8n_dispatch["storage_path"], "uploads/fake.pdf")
-        self.assertEqual(result.n8n_dispatch["payload"]["destination_folder_id"], result.destination_folder_id)
+        self.assertEqual(len(storage.calls), 1)
+        self.assertEqual(result.storage_upload["storage_path"], "uploads/fake.pdf")
+        self.assertEqual(result.n8n_dispatch, {})
+        self.assertEqual(len(dispatch.calls), 0)
         self.assertEqual(fake_ai.calls, 0)
+
+    def test_confirm_and_send_ready_document_posts_to_n8n_and_logs(self) -> None:
+        acme = client("001", "ACME LTDA", "12345678000199")
+        dispatch = FakeN8NDispatchService()
+        log_repository = MemoryLogRepository()
+        processor, _ = build_processor(
+            [acme],
+            [route("001", "2026-03")],
+            dispatch_service=dispatch,
+            log_repository=log_repository,
+        )
+
+        result = processor.process_file(
+            filename="fatura_acme.txt",
+            content=(
+                "Fatura do cartao credito cliente codigo 001 "
+                "vencimento 10/04/2026 total R$ 100,00"
+            ).encode("utf-8"),
+            department="contabil",
+        )
+        confirmed = processor.confirm_and_send(
+            result,
+            user_name="Erlane",
+            user_department="contabil",
+            source_channel="E-mail",
+        )
+
+        self.assertEqual(confirmed.status, CoreProcessingStatus.READY_TO_SEND)
+        self.assertEqual(len(dispatch.calls), 1)
+        self.assertTrue(confirmed.n8n_dispatch["send_ok"])
+        self.assertEqual(confirmed.n8n_dispatch["payload"]["destination_folder_id"], result.destination_folder_id)
+        self.assertEqual(len(log_repository.logs), 1)
+        self.assertEqual(log_repository.logs[0].action, "N8N_ENVIO_CONFIRMADO")
 
     def test_openai_does_not_override_deterministic_institution(self) -> None:
         acme = client("001", "ACME LTDA", "12345678000199")

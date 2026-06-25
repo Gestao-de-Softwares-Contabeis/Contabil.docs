@@ -56,17 +56,21 @@ class ParametrizationService:
     def create_rule(
         self,
         client_code: str,
-        rule_type: RuleType,
+        rule_type: RuleType | str,
         document_type: str,
         institution: str | None,
         pattern: dict[str, str],
         destination_folder: str,
         created_by: str,
         created_by_department: str | None = None,
-    ) -> None:
+        file_extension: str | None = None,
+        notes: str | None = None,
+        is_active: bool = True,
+    ) -> DocumentRule:
         rule_type_value = rule_type.value if isinstance(rule_type, RuleType) else str(rule_type)
         rule = DocumentRule(
             client_code=client_code,
+            file_extension=file_extension.lower().lstrip(".") if file_extension else None,
             rule_type=rule_type_value,
             document_type=document_type,
             rule_name=pattern.get("rule_name") or None,
@@ -76,9 +80,11 @@ class ParametrizationService:
             account_number=pattern.get("account_number") or None,
             sheet_name=pattern.get("sheet_name") or None,
             column_name=pattern.get("column_name") or None,
+            row_number=int(pattern["row_number"]) if pattern.get("row_number", "").isdigit() else None,
             match_mode=pattern.get("match_mode") or "contains",
-            is_active=True,
+            is_active=is_active,
             created_by=created_by,
+            notes=notes or None,
         )
         saved_rule = self.rule_repository.create(rule)
         self.log_repository.insert(
@@ -92,9 +98,16 @@ class ParametrizationService:
                 status=ProcessingStatus.WAITING_RULES.value,
                 destination_folder=destination_folder or None,
                 observation=f"Regra criada: {saved_rule.id}",
-                metadata={"rule_type": rule_type_value, "pattern": pattern},
+                metadata={
+                    "rule_type": rule_type_value,
+                    "pattern": pattern,
+                    "file_extension": file_extension,
+                    "notes": notes,
+                    "is_active": is_active,
+                },
             )
         )
+        return saved_rule
 
     def toggle_rule(
         self,

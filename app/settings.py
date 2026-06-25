@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import logging
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 
@@ -26,12 +29,41 @@ def _load_env_file(path: Path) -> None:
             os.environ[key] = value
 
 
+def load_env() -> None:
+    logging.getLogger("dotenv.main").setLevel(logging.ERROR)
+    load_dotenv(ROOT_DIR / ".env", override=True)
+    _load_env_file(ROOT_DIR / ".env")
+
+
 def _first_env(names: list[str], default: str = "") -> str:
     for name in names:
         value = os.getenv(name)
         if value:
             return value.strip()
     return default
+
+
+def get_n8n_webhook_url() -> str:
+    load_env()
+    url = _first_env(["N8N_WEBHOOK_URL", "N8N_TEST_WEBHOOK_URL"])
+    if not url:
+        raise ValueError(
+            "Webhook n8n nao configurado. Defina N8N_WEBHOOK_URL ou N8N_TEST_WEBHOOK_URL no .env."
+        )
+    return url
+
+
+def get_n8n_webhook_debug_info() -> dict[str, str]:
+    load_env()
+    for variable in ["N8N_WEBHOOK_URL", "N8N_TEST_WEBHOOK_URL"]:
+        url = os.getenv(variable, "").strip()
+        if url:
+            parsed = urlparse(url)
+            endpoint = f"{parsed.netloc}{parsed.path}" if parsed.netloc else parsed.path
+            return {"variable": variable, "endpoint": endpoint}
+    raise ValueError(
+        "Webhook n8n nao configurado. Defina N8N_WEBHOOK_URL ou N8N_TEST_WEBHOOK_URL no .env."
+    )
 
 
 def _csv_env(name: str, default: list[str]) -> list[str]:
@@ -71,7 +103,7 @@ class AppSettings(BaseModel):
 
 @lru_cache(maxsize=1)
 def load_settings() -> AppSettings:
-    _load_env_file(ROOT_DIR / ".env")
+    load_env()
     return AppSettings(
         supabase_url=_first_env(["SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL", "link"]),
         supabase_key=_first_env(
@@ -89,7 +121,6 @@ def load_settings() -> AppSettings:
             [
                 "N8N_WEBHOOK_URL",
                 "N8N_TEST_WEBHOOK_URL",
-                "N8N_RECEBER_DOCUMENTO_WEBHOOK_URL",
             ]
         ),
         supabase_storage_bucket=_first_env(["SUPABASE_STORAGE_BUCKET"], "incoming-documents"),

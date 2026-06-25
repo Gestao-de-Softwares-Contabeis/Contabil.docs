@@ -7,6 +7,7 @@ from pathlib import Path
 from models.client import Client, StorageRoute
 from models.conflict_resolution import ConflictResolutionRequest
 from models.document import CoreProcessingStatus, DocumentLogEntry
+from models.integration import StorageUploadResult
 from models.rule import DocumentRule
 from services.conflict_resolution_service import ConflictResolutionService
 from services.core_processor import CoreProcessor
@@ -86,6 +87,18 @@ class MemoryLogRepository:
         return entry
 
 
+class FakeStorageService:
+    def upload_and_sign(self, document: object, storage_path: str | None = None) -> StorageUploadResult:
+        return StorageUploadResult(
+            upload_ok=True,
+            bucket="incoming-documents",
+            storage_path=storage_path or "uploads/fake.pdf",
+            tamanho=getattr(document, "size_bytes", 0),
+            signed_url="https://signed.example/fake.pdf",
+            signed_url_ttl_seconds=600,
+        )
+
+
 def client(code: str, name: str, cnpj: str) -> Client:
     return Client(id=f"client-{code}", client_code=code, name=name, cnpj=cnpj)
 
@@ -125,6 +138,7 @@ class ConflictResolutionServiceTest(unittest.TestCase):
         core = CoreProcessor(
             identification_service=identification,
             routing_service=RoutingService(repository=routing_repository),
+            storage_service=FakeStorageService(),
         )
         log_repository = MemoryLogRepository()
         service = ConflictResolutionService(

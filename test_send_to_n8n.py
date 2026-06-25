@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from app.settings import get_n8n_webhook_url
 from database.supabase_client import get_supabase_client
 
 
@@ -16,6 +16,13 @@ DEFAULT_SIGNED_URL_TTL_SECONDS = 600
 DEFAULT_WEBHOOK_URL = ""
 DEFAULT_NEW_FILE_NAME = "TESTE FINAL - 062026.pdf"
 DEFAULT_DESTINATION_FOLDER_ID = "COLE_AQUI_O_ID_DA_PASTA_TESTE_ONEDRIVE"
+
+
+def default_webhook_url() -> str:
+    try:
+        return get_n8n_webhook_url()
+    except ValueError:
+        return DEFAULT_WEBHOOK_URL
 
 
 def create_signed_url(
@@ -105,7 +112,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--webhook-url",
-        default=os.getenv("N8N_TEST_WEBHOOK_URL", DEFAULT_WEBHOOK_URL),
+        default=default_webhook_url(),
         help="URL do webhook de teste do n8n.",
     )
     parser.add_argument(

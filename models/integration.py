@@ -26,4 +26,6 @@ class N8NDispatchResult(BaseModel):
     n8n_status_code: int | None = None
     n8n_response_body: str | None = None
     error: str | None = None
+    webhook_variable: str | None = None
+    webhook_endpoint: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
