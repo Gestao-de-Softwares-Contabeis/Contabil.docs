@@ -79,6 +79,38 @@ class SupabaseStorageService:
             )
             return False
 
+    def sign_existing_object(self, storage_path: str, size_bytes: int = 0) -> StorageUploadResult:
+        normalized_path = storage_path.strip().lstrip("/")
+        if not normalized_path:
+            raise ValueError("storage_path vazio para gerar signed URL.")
+        signed_response = self.client.storage.from_(self.bucket).create_signed_url(
+            normalized_path,
+            self.signed_url_ttl_seconds,
+        )
+        signed_url = signed_response.get("signedUrl") or signed_response.get("signedURL")
+        if not signed_url:
+            raise RuntimeError(f"Supabase nao retornou signed URL: {signed_response}")
+        return StorageUploadResult(
+            upload_ok=True,
+            bucket=self.bucket,
+            storage_path=normalized_path,
+            tamanho=size_bytes,
+            signed_url=str(signed_url),
+            signed_url_ttl_seconds=self.signed_url_ttl_seconds,
+            response_path=normalized_path,
+        )
+
+    def download_object(self, storage_path: str) -> bytes:
+        normalized_path = storage_path.strip().lstrip("/")
+        if not normalized_path:
+            raise ValueError("storage_path vazio para download.")
+        response = self.client.storage.from_(self.bucket).download(normalized_path)
+        if isinstance(response, bytes):
+            return response
+        if hasattr(response, "content"):
+            return bytes(response.content)
+        return bytes(response)
+
     def build_storage_path(self, document: UploadedDocument) -> str:
         safe_name = sanitize_filename_part(document.original_filename, "documento")
         hash_prefix = document.file_hash[:12] if document.file_hash else "sem_hash"

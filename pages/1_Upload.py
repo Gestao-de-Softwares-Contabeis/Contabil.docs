@@ -6,10 +6,13 @@ from pathlib import Path
 
 import streamlit as st
 
-from app.session_state import ensure_document_state, get_documents, upsert_document
 from app.supabase_lists import collaborator_department, collaborator_names, safe_active_collaborators
 from database.supabase_client import SupabaseConfigurationError
+from models.document import CoreDocumentResult, CoreProcessingStatus
+from parsers.document_parsers import DocumentParserService
+from repositories.document_queue_repository import DocumentQueueRepository
 from services.core_processor import CoreProcessor
+from services.storage_service import SupabaseStorageService
 from utils.structured_logging import get_logger
 
 
@@ -18,65 +21,79 @@ ALLOWED_TYPES = ["pdf", "ofx", "xls", "xlsx", "csv", "txt"]
 CHANNELS = ["Onvio", "E-mail", "WhatsApp/Messenger", "Drive do cliente", "Outros"]
 
 
-def _save_temp_file(uploaded_file: object) -> Path:
+def _save_temp_file(uploaded_file: object) -> tuple[Path, str, bytes]:
     temp_dir = Path(tempfile.gettempdir()) / "contabil_docs_uploads"
     temp_dir.mkdir(parents=True, exist_ok=True)
-    suffix = Path(uploaded_file.name).suffix
+    original_file_name = str(uploaded_file.name)
+    content = uploaded_file.getvalue()
+    suffix = Path(original_file_name).suffix
     temp_path = temp_dir / f"{uuid.uuid4().hex}{suffix}"
-    temp_path.write_bytes(uploaded_file.getvalue())
-    return temp_path
+    temp_path.write_bytes(content)
+    return temp_path, original_file_name, content
 
 
 def _analyze_and_upsert(
-    temp_path: Path,
+    original_file_name: str,
+    content: bytes,
     sender_name: str,
     sender_department: str | None,
     origin_channel: str,
-) -> bool:
-    result = CoreProcessor().analyze_path(temp_path, department=sender_department or "contabil")
-    return upsert_document(
-        temp_path=temp_path,
-        sender_name=sender_name,
-        sender_department=sender_department,
-        origin_channel=origin_channel,
-        result=result,
+) -> tuple[bool, str]:
+    result = CoreProcessor().analyze_file(
+        filename=original_file_name,
+        content=content,
+        department=sender_department or "contabil",
     )
+    _ensure_storage_upload(original_file_name, content, result)
+    _, was_created = DocumentQueueRepository().upsert_document_queue(
+        result=result,
+        uploaded_by=sender_name,
+        source_channel=origin_channel,
+    )
+    return was_created, result.status.value
+
+
+def _ensure_storage_upload(original_file_name: str, content: bytes, result: CoreDocumentResult) -> None:
+    if getattr(result, "storage_upload", None) and result.storage_upload.get("storage_path"):
+        return
+    uploaded = DocumentParserService().parse(original_file_name, content)
+    storage_result = SupabaseStorageService().upload_and_sign(uploaded)
+    result.storage_upload = storage_result.model_dump(mode="json", exclude_none=True)
+    result.extracted_summary["storage_upload"] = result.storage_upload
 
 
 def _show_error(message: str, exc: Exception) -> None:
-    logger.exception(message)
-    st.error(f"{message}: {exc}")
+    logger.exception(message, extra={"ctx_error": str(exc)})
+    st.error(message)
 
 
-ensure_document_state()
+def _ordered_collaborator_names() -> list[str]:
+    return sorted(collaborator_names(collaborators), key=lambda name: name.lower())
 
-st.title("Upload de documentos")
-st.caption("Anexe os arquivos e rode somente a analise. O envio ao n8n acontece apenas na confirmacao.")
+
+st.title("Upload")
+st.caption("Anexe os documentos e rode a analise. O envio acontece apenas na confirmacao.")
 
 collaborators, collaborators_error = safe_active_collaborators()
-collaborator_options = collaborator_names(collaborators)
+collaborator_options = _ordered_collaborator_names()
 
 with st.form("upload_form", clear_on_submit=False):
     if collaborators_error:
         st.warning("Nao foi possivel carregar colaboradores do Supabase.")
 
-    sender_name = st.selectbox(
-        "Quem esta enviando",
-        collaborator_options,
-        disabled=not collaborator_options,
-    )
-    sender_department = collaborator_department(collaborators, sender_name) if sender_name else None
+    top_col1, top_col2 = st.columns(2)
+    with top_col1:
+        sender_name = st.selectbox(
+            "Quem enviou",
+            collaborator_options,
+            disabled=not collaborator_options,
+        )
+        sender_department = collaborator_department(collaborators, sender_name) if sender_name else None
+    with top_col2:
+        channel = st.selectbox("Canal de origem", CHANNELS)
 
-    channel = st.selectbox("Canal de origem", CHANNELS)
-    other_channel = ""
-    if channel == "Outros":
-        other_channel = st.text_input("Especificar origem")
-
-    uploaded_files = st.file_uploader(
-        "Arquivos",
-        type=ALLOWED_TYPES,
-        accept_multiple_files=True,
-    )
+    other_channel = st.text_input("Especificar origem") if channel == "Outros" else ""
+    uploaded_files = st.file_uploader("Arquivos", type=ALLOWED_TYPES, accept_multiple_files=True)
 
     submitted = st.form_submit_button(
         "Analisar documentos",
@@ -95,24 +112,41 @@ if submitted:
         created = 0
         updated = 0
         errors = 0
-        for index, uploaded_file in enumerate(uploaded_files, start=1):
-            try:
-                temp_path = _save_temp_file(uploaded_file)
-                was_created = _analyze_and_upsert(temp_path, sender_name, sender_department, origin_channel)
-                if was_created:
-                    created += 1
-                else:
-                    updated += 1
-            except SupabaseConfigurationError as exc:
-                errors += 1
-                st.error(str(exc))
-            except Exception as exc:
-                errors += 1
-                _show_error(f"Falha ao analisar {uploaded_file.name}", exc)
-            progress.progress(index / len(uploaded_files))
+        status_counts: dict[str, int] = {}
+        with st.spinner("Analisando documentos..."):
+            for index, uploaded_file in enumerate(uploaded_files, start=1):
+                try:
+                    _, original_file_name, content = _save_temp_file(uploaded_file)
+                    was_created, status = _analyze_and_upsert(
+                        original_file_name,
+                        content,
+                        sender_name,
+                        sender_department,
+                        origin_channel,
+                    )
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                    if was_created:
+                        created += 1
+                    else:
+                        updated += 1
+                except SupabaseConfigurationError as exc:
+                    errors += 1
+                    _show_error("Supabase nao esta configurado para analisar documentos.", exc)
+                except Exception as exc:
+                    errors += 1
+                    _show_error(f"Nao foi possivel analisar {uploaded_file.name}.", exc)
+                progress.progress(index / len(uploaded_files))
 
         total_processed = created + updated
         if total_processed:
+            ready = status_counts.get(CoreProcessingStatus.READY_TO_SEND.value, 0)
+            review = status_counts.get(CoreProcessingStatus.REVIEW.value, 0)
+            identification_error = status_counts.get(CoreProcessingStatus.IDENTIFICATION_ERROR.value, 0)
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("Analisados", total_processed)
+            metric_cols[1].metric("Prontos", ready)
+            metric_cols[2].metric("Revisar", review)
+            metric_cols[3].metric("Erro", identification_error + errors)
             st.success(
                 f"Analise concluida: {created} novo(s), {updated} atualizado(s) por hash."
             )
@@ -121,5 +155,10 @@ if submitted:
             st.warning(f"{errors} arquivo(s) com erro na analise.")
 
 st.divider()
-st.subheader("Resultados nesta sessao")
-st.write(f"{len(get_documents())} documento(s) em verificacao.")
+st.subheader("Fila operacional")
+try:
+    queue_count = len(DocumentQueueRepository().list_pending_documents(limit=1000))
+    st.write(f"{queue_count} documento(s) pendente(s) em document_queue.")
+except Exception as exc:
+    logger.exception("Nao foi possivel consultar document_queue", extra={"ctx_error": str(exc)})
+    st.warning("Nao foi possivel consultar a fila agora.")

@@ -1,21 +1,18 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import streamlit as st
 
 from app.settings import get_n8n_webhook_debug_info
-from app.session_state import (
-    clear_pending_documents,
-    ensure_document_state,
-    get_documents,
-    remove_sent_documents,
-    update_document_result,
-)
 from models.document import CoreDocumentResult, CoreProcessingStatus
+from models.document_queue import DocumentQueueItem, QUEUE_SEND_ERROR_STATUS, QUEUE_SENDING_STATUS
+from repositories.document_queue_repository import DocumentQueueRepository
+from services.checklist_service import ChecklistService
 from services.core_processor import CoreProcessor
+from services.storage_service import SupabaseStorageService
 from utils.structured_logging import get_logger
+from utils.ui_formatting import format_competence, format_score, status_sort_key
 
 
 logger = get_logger(__name__)
@@ -24,60 +21,50 @@ READY_STATUS = CoreProcessingStatus.READY_TO_SEND.value
 REVIEW_STATUSES = {
     CoreProcessingStatus.REVIEW.value,
     CoreProcessingStatus.IDENTIFICATION_ERROR.value,
-    "ERRO_ENVIO",
+    QUEUE_SEND_ERROR_STATUS,
 }
 
 DISPLAY_COLUMNS = [
     "selecionar",
     "score",
+    "status",
     "motivo_revisao",
-    "nome_arquivo",
-    "extensao",
-    "cliente_identificado",
+    "arquivo",
+    "cliente",
     "cnpj",
     "competencia",
-    "tipo_documento",
+    "tipo",
+    "extensao",
     "instituicao",
-    "status",
-    "caminho_destino",
-    "novo_nome_arquivo",
+    "destino",
+    "novo_nome",
 ]
 ACTION_MESSAGES_KEY = "document_action_messages"
 
 
-def _current_status(item: dict[str, Any]) -> str:
-    if item.get("ui_status"):
-        return str(item["ui_status"])
-    result: CoreDocumentResult = item["result"]
-    return result.status.value
+def _document_sort_key(item: DocumentQueueItem) -> tuple[int, float, str]:
+    score = float(item.confidence or 0)
+    return (*status_sort_key(item.status), score, str(item.original_file_name or ""))
 
 
-def _review_reason(item: dict[str, Any]) -> str | None:
-    if item.get("send_error"):
-        return str(item["send_error"])
-    result: CoreDocumentResult = item["result"]
-    return result.review_reason
-
-
-def _result_rows(documents: list[dict[str, Any]]) -> list[dict[str, object]]:
+def _result_rows(documents: list[DocumentQueueItem]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for item in documents:
-        result: CoreDocumentResult = item["result"]
         rows.append(
             {
                 "selecionar": False,
-                "score": result.confidence,
-                "motivo_revisao": _review_reason(item),
-                "nome_arquivo": result.original_file_name,
-                "extensao": result.extension,
-                "cliente_identificado": result.detected_client_name,
-                "cnpj": result.detected_client_cnpj,
-                "competencia": result.competence,
-                "tipo_documento": result.document_type,
-                "instituicao": result.institution,
-                "status": _current_status(item),
-                "caminho_destino": result.destination_path_readable,
-                "novo_nome_arquivo": result.new_file_name,
+                "score": format_score(item.confidence),
+                "status": item.status,
+                "motivo_revisao": item.review_reason,
+                "arquivo": item.original_file_name,
+                "cliente": item.client_name,
+                "cnpj": item.client_cnpj,
+                "competencia": format_competence(item.competence),
+                "tipo": item.document_type,
+                "extensao": item.extension,
+                "instituicao": item.institution,
+                "destino": item.destination_path_readable,
+                "novo_nome": item.new_file_name,
             }
         )
     return rows
@@ -89,37 +76,59 @@ def _records_from_editor(edited_rows: object) -> list[dict[str, object]]:
     return list(edited_rows)  # type: ignore[arg-type]
 
 
-def _selected_items(edited_rows: object, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
+def _selected_items(edited_rows: object, documents: list[DocumentQueueItem]) -> list[DocumentQueueItem]:
+    selected: list[DocumentQueueItem] = []
     for index, row in enumerate(_records_from_editor(edited_rows)):
         if row.get("selecionar") and index < len(documents):
             selected.append(documents[index])
     return selected
 
 
-def _show_error(message: str, exc: Exception) -> None:
-    logger.exception(message)
-    st.error(f"{message}: {exc}")
-
-
-def _button_state(selected: list[dict[str, Any]]) -> tuple[bool, bool, bool]:
+def _button_state(selected: list[DocumentQueueItem]) -> tuple[bool, bool, bool]:
     if not selected:
         return True, True, True
 
-    statuses = [_current_status(item) for item in selected]
+    statuses = [item.status for item in selected]
     all_ready = all(status == READY_STATUS for status in statuses)
     has_review = any(status in REVIEW_STATUSES for status in statuses)
-
-    confirm_disabled = not all_ready
-    reprocess_disabled = False
-    parametrize_disabled = not has_review
-    return confirm_disabled, reprocess_disabled, parametrize_disabled
+    return not all_ready, False, not has_review
 
 
-ensure_document_state()
+def _file_size_from_payload(item: DocumentQueueItem) -> int:
+    payload = item.payload_json or {}
+    summary = payload.get("extracted_summary") if isinstance(payload.get("extracted_summary"), dict) else {}
+    return int(summary.get("file_size_bytes") or 0)
+
+
+def _refresh_storage_for_send(item: DocumentQueueItem) -> CoreDocumentResult:
+    if not item.storage_path:
+        raise ValueError("Documento sem storage_path na fila; reenvie ou reprocesse o arquivo.")
+
+    storage_service = SupabaseStorageService()
+    signed = storage_service.sign_existing_object(item.storage_path, size_bytes=_file_size_from_payload(item))
+    result = item.to_core_result()
+    result.storage_upload = signed.model_dump(mode="json", exclude_none=True)
+    result.extracted_summary["storage_upload"] = result.storage_upload
+    DocumentQueueRepository().update_storage_url(str(item.id), signed.signed_url)
+    return result
+
+
+def _reprocess_item(item: DocumentQueueItem) -> CoreDocumentResult:
+    if not item.storage_path:
+        raise ValueError("Documento sem storage_path; nao e possivel reprocessar pela fila persistente.")
+
+    storage_service = SupabaseStorageService()
+    content = storage_service.download_object(item.storage_path)
+    filename = item.original_file_name or item.storage_path.rsplit("/", 1)[-1]
+    return CoreProcessor().analyze_file(filename, content, department="contabil")
+
+
+def _queue_message(level: str, text: str) -> dict[str, str]:
+    return {"level": level, "text": text}
+
 
 st.title("Documentos a verificar")
-st.caption("Somente documentos PRONTO_ENVIO podem ser confirmados para o n8n.")
+st.caption("Revise pendencias e envie somente documentos prontos.")
 
 for message in st.session_state.pop(ACTION_MESSAGES_KEY, []):
     level = message.get("level", "info")
@@ -133,22 +142,47 @@ for message in st.session_state.pop(ACTION_MESSAGES_KEY, []):
     else:
         st.info(text)
 
-documents = get_documents()
+repository = DocumentQueueRepository()
+try:
+    documents = sorted(repository.list_pending_documents(), key=_document_sort_key)
+except Exception as exc:
+    logger.exception("Falha ao carregar document_queue", extra={"ctx_error": str(exc)})
+    st.error("Nao foi possivel carregar os documentos pendentes.")
+    st.stop()
+
 if not documents:
-    st.info("Nenhum documento analisado nesta sessao.")
+    st.info("Nenhum documento pendente na document_queue.")
     st.page_link("pages/1_Upload.py", label="Ir para Upload")
     st.stop()
 
-rows = _result_rows(documents)
+status_totals = {
+    "Prontos": sum(1 for item in documents if item.status == READY_STATUS),
+    "Revisar": sum(1 for item in documents if item.status == CoreProcessingStatus.REVIEW.value),
+    "Erro": sum(1 for item in documents if item.status in {CoreProcessingStatus.IDENTIFICATION_ERROR.value, QUEUE_SEND_ERROR_STATUS}),
+}
+metric_cols = st.columns(4)
+metric_cols[0].metric("Pendentes", len(documents))
+metric_cols[1].metric("Prontos", status_totals["Prontos"])
+metric_cols[2].metric("Revisar", status_totals["Revisar"])
+metric_cols[3].metric("Erro", status_totals["Erro"])
+
 edited = st.data_editor(
-    rows,
+    _result_rows(documents),
     use_container_width=True,
     hide_index=True,
     disabled=[column for column in DISPLAY_COLUMNS if column != "selecionar"],
     column_order=DISPLAY_COLUMNS,
     column_config={
-        "selecionar": st.column_config.CheckboxColumn("selecionar"),
-        "score": st.column_config.NumberColumn("score", format="%.2f"),
+        "selecionar": st.column_config.CheckboxColumn("Selecionar"),
+        "score": st.column_config.TextColumn("Score"),
+        "status": st.column_config.TextColumn("Status"),
+        "motivo_revisao": st.column_config.TextColumn("Motivo"),
+        "arquivo": st.column_config.TextColumn("Arquivo"),
+        "cliente": st.column_config.TextColumn("Cliente"),
+        "competencia": st.column_config.TextColumn("Competencia"),
+        "tipo": st.column_config.TextColumn("Tipo"),
+        "destino": st.column_config.TextColumn("Destino"),
+        "novo_nome": st.column_config.TextColumn("Novo nome"),
     },
 )
 
@@ -161,114 +195,95 @@ if debug_n8n:
         debug_info = get_n8n_webhook_debug_info()
         st.info(f"Webhook n8n: {debug_info['variable']} -> {debug_info['endpoint']}")
     except ValueError as exc:
-        st.warning(str(exc))
+        logger.warning("Webhook n8n nao configurado", extra={"ctx_error": str(exc)})
+        st.warning("Webhook n8n nao configurado.")
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    if st.button("Confirmar envio selecionados", type="primary", disabled=confirm_disabled):
+    if st.button("Enviar selecionados", type="primary", disabled=confirm_disabled):
         sent = 0
         failed = 0
         messages: list[dict[str, str]] = []
-        for item in selected:
-            result: CoreDocumentResult = item["result"]
-            if _current_status(item) != READY_STATUS:
-                continue
+        with st.spinner("Enviando documentos..."):
+            for item in selected:
+                if item.status != READY_STATUS or not item.id:
+                    continue
+                result: CoreDocumentResult | None = None
+                try:
+                    repository.update_document_status(str(item.id), QUEUE_SENDING_STATUS)
+                    if debug_n8n:
+                        debug_info = get_n8n_webhook_debug_info()
+                        messages.append(
+                            _queue_message("info", f"Webhook n8n usado: {debug_info['variable']} -> {debug_info['endpoint']}")
+                        )
 
-            try:
-                if debug_n8n:
-                    debug_info = get_n8n_webhook_debug_info()
-                    messages.append(
-                        {
-                            "level": "info",
-                            "text": f"Webhook n8n usado: {debug_info['variable']} -> {debug_info['endpoint']}",
-                        }
+                    result = _refresh_storage_for_send(item)
+                    updated_result = CoreProcessor().confirm_and_send(
+                        result,
+                        user_name=item.uploaded_by or "sistema",
+                        user_department="contabil",
+                        source_channel=item.source_channel,
                     )
-                updated_result = CoreProcessor().confirm_and_send(
-                    result,
-                    user_name=item.get("sender_name") or "sistema",
-                    user_department=item.get("sender_department"),
-                    source_channel=item.get("origin_channel"),
-                )
-                item["result"] = updated_result
-                send_ok = bool(updated_result.n8n_dispatch.get("send_ok"))
-                if send_ok:
-                    item["sent"] = True
-                    item["confirmed"] = True
-                    sent += 1
-                    messages.append(
-                        {
-                            "level": "success",
-                            "text": f"Documento enviado com sucesso: {updated_result.original_file_name}",
-                        }
-                    )
-                else:
+                    send_ok = bool(updated_result.n8n_dispatch.get("send_ok"))
+                    if send_ok:
+                        sent_item = repository.mark_as_sent(str(item.id), updated_result)
+                        try:
+                            checklist_service = ChecklistService()
+                            checklist_service.mark_received_after_send(sent_item)
+                        except Exception as checklist_exc:
+                            logger.warning(
+                                "Falha ao atualizar checklist apos envio",
+                                extra={"ctx_queue_id": item.id, "ctx_error": str(checklist_exc)},
+                            )
+                        sent += 1
+                        messages.append(_queue_message("success", f"Documento enviado com sucesso: {item.original_file_name}"))
+                    else:
+                        failed += 1
+                        error = str(
+                            updated_result.n8n_dispatch.get("error")
+                            or updated_result.n8n_dispatch.get("n8n_response_body")
+                            or "Falha sem detalhe retornado pelo n8n."
+                        )
+                        repository.mark_as_error(str(item.id), error, updated_result)
+                        logger.warning("Falha retornada pelo n8n", extra={"ctx_queue_id": item.id, "ctx_error": error})
+                        messages.append(_queue_message("error", f"Nao foi possivel enviar {item.original_file_name}."))
+                except Exception as exc:
                     failed += 1
-                    error = str(
-                        updated_result.n8n_dispatch.get("error")
-                        or updated_result.n8n_dispatch.get("n8n_response_body")
-                        or "Falha sem detalhe retornado pelo n8n."
-                    )
-                    messages.append(
-                        {
-                            "level": "error",
-                            "text": f"Falha ao enviar {updated_result.original_file_name}: {error}",
-                        }
-                    )
-                    item["ui_status"] = "ERRO_ENVIO"
-                    item["send_error"] = error
-            except Exception as exc:
-                failed += 1
-                messages.append(
-                    {
-                        "level": "error",
-                        "text": f"Falha ao confirmar {result.original_file_name}: {exc}",
-                    }
-                )
-                item["ui_status"] = "ERRO_ENVIO"
-                item["send_error"] = str(exc)
-                logger.exception("Falha ao confirmar envio", extra={"ctx_file": result.original_file_name})
+                    repository.mark_as_error(str(item.id), str(exc), result)
+                    logger.exception("Falha ao confirmar envio", extra={"ctx_queue_id": item.id, "ctx_error": str(exc)})
+                    messages.append(_queue_message("error", f"Nao foi possivel enviar {item.original_file_name}."))
 
-        removed = remove_sent_documents()
         if sent:
-            messages.append(
-                {
-                    "level": "success",
-                    "text": f"{sent} documento(s) enviado(s) e removido(s) da lista de verificacao.",
-                }
-            )
+            messages.append(_queue_message("success", f"{sent} documento(s) enviado(s) e marcados como ENVIADO."))
         if failed:
-            messages.append(
-                {
-                    "level": "warning",
-                    "text": f"{failed} documento(s) permaneceram na lista com erro de envio.",
-                }
-            )
-        if removed or failed or messages:
-            st.session_state[ACTION_MESSAGES_KEY] = messages
-            st.rerun()
+            messages.append(_queue_message("warning", f"{failed} documento(s) permaneceram na fila com erro de envio."))
+        st.session_state[ACTION_MESSAGES_KEY] = messages
+        st.rerun()
 
 with col2:
-    if st.button("Reprocessar selecionados", disabled=reprocess_disabled):
+    if st.button("Reprocessar", disabled=reprocess_disabled):
         reprocessed = 0
         ready = 0
         still_pending = 0
-        for item in selected:
-            try:
-                temp_path = Path(str(item["temp_path"]))
-                result = CoreProcessor().analyze_path(
-                    temp_path,
-                    department=item.get("sender_department") or "contabil",
-                )
-                update_document_result(str(item["id"]), result)
-                reprocessed += 1
-                if result.status == CoreProcessingStatus.READY_TO_SEND:
-                    ready += 1
-                else:
+        with st.spinner("Reprocessando documentos..."):
+            for item in selected:
+                try:
+                    result = _reprocess_item(item)
+                    repository.upsert_document_queue(
+                        result=result,
+                        uploaded_by=item.uploaded_by,
+                        source_channel=item.source_channel,
+                    )
+                    reprocessed += 1
+                    if result.status == CoreProcessingStatus.READY_TO_SEND:
+                        ready += 1
+                    else:
+                        still_pending += 1
+                except Exception as exc:
                     still_pending += 1
-            except Exception as exc:
-                still_pending += 1
-                _show_error(f"Falha ao reprocessar {item['result'].original_file_name}", exc)
+                    logger.exception("Falha ao reprocessar documento", extra={"ctx_queue_id": item.id, "ctx_error": str(exc)})
+                    st.error(f"Nao foi possivel reprocessar {item.original_file_name}.")
 
         if reprocessed:
             st.success(
@@ -278,12 +293,12 @@ with col2:
             st.rerun()
 
 with col3:
-    if st.button("Parametrizar selecionado", disabled=parametrize_disabled):
-        needs_param = [item for item in selected if _current_status(item) in REVIEW_STATUSES]
+    if st.button("Parametrizar", disabled=parametrize_disabled):
+        needs_param = [item for item in selected if item.status in REVIEW_STATUSES]
         if len(needs_param) != 1:
             st.warning("Selecione somente um documento em revisao/erro para parametrizar.")
         else:
-            st.session_state["parametrization_document_id"] = needs_param[0]["id"]
+            st.session_state["parametrization_queue_id"] = needs_param[0].id
             st.switch_page("pages/3_Parametrizacao.py")
 
 if not selected:
@@ -292,16 +307,28 @@ elif confirm_disabled:
     st.info("Confirmar envio so fica habilitado quando 100% dos selecionados estao PRONTO_ENVIO.")
 
 st.divider()
-st.subheader("Limpeza")
-confirm_cleanup = st.checkbox("Confirmo que desejo limpar os documentos pendentes desta sessao")
-if st.button("Limpar documentos pendentes", disabled=not confirm_cleanup):
-    stats = clear_pending_documents()
-    st.success(
-        "Pendentes limpos: "
-        f"{stats['removed']} removido(s), "
-        f"{stats['local_deleted']} temporario(s) local(is) apagado(s), "
-        f"{stats['storage_deleted']} objeto(s) removido(s) do Storage."
-    )
-    if stats.get("storage_errors"):
-        st.warning(f"{stats['storage_errors']} objeto(s) nao puderam ser removidos do Storage.")
-    st.rerun()
+with st.expander("Limpar pendentes"):
+    confirm_cleanup = st.checkbox("Confirmo que desejo limpar os documentos pendentes da fila")
+    if st.button("Limpar pendentes", disabled=not confirm_cleanup):
+        storage_service = SupabaseStorageService()
+        removed = 0
+        storage_deleted = 0
+        storage_errors = 0
+        with st.spinner("Limpando pendentes..."):
+            for item in documents:
+                if not item.id:
+                    continue
+                if item.storage_path:
+                    if storage_service.delete_object(item.storage_path):
+                        storage_deleted += 1
+                    else:
+                        storage_errors += 1
+                repository.discard_document(str(item.id))
+                removed += 1
+
+        st.success(f"Pendentes descartados: {removed}.")
+        if storage_deleted:
+            st.info(f"{storage_deleted} arquivo(s) removido(s) do Storage.")
+        if storage_errors:
+            st.warning(f"{storage_errors} arquivo(s) nao puderam ser removidos do Storage.")
+        st.rerun()

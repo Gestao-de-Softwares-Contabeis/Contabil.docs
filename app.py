@@ -15,7 +15,7 @@ except ValueError:
 
 with st.sidebar:
     st.title("Contabil.docs")
-    st.caption("Catalogacao e roteamento documental")
+    st.caption("V1 operacional")
     if settings.supabase_is_configured:
         st.success("Supabase configurado")
     else:
@@ -26,8 +26,9 @@ with st.sidebar:
         st.warning("n8n sem webhook no .env")
 
 pages = [
-    st.Page("pages/1_Upload.py", title="Upload de documentos", url_path="upload"),
+    st.Page("pages/1_Upload.py", title="Upload", url_path="upload"),
     st.Page("pages/2_Documentos_a_Verificar.py", title="Documentos a verificar", url_path="documentos"),
+    st.Page("pages/5_Checklist.py", title="Checklist", url_path="checklist"),
     st.Page("pages/3_Parametrizacao.py", title="Parametrizacao", url_path="parametrizacao"),
     st.Page("pages/4_Historico.py", title="Historico", url_path="historico"),
 ]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import streamlit as st
 
@@ -8,20 +8,22 @@ from models.document import ProcessingStatus
 from services.history_service import HistoryService
 from services.parametrization_service import ParametrizationService
 from utils.structured_logging import get_logger
+from utils.ui_formatting import client_code_sort_key, format_competence, format_datetime
 
 
 logger = get_logger(__name__)
 
 
 def _show_error(message: str, exc: Exception) -> None:
-    logger.exception(message)
-    st.error(f"{message}: {exc}")
+    logger.exception(message, extra={"ctx_error": str(exc)})
+    st.error(message)
 
 
 st.title("Historico")
+st.caption("Registro dos processamentos e envios.")
 
 try:
-    clients = ParametrizationService().list_clients()
+    clients = sorted(ParametrizationService().list_clients(), key=lambda item: client_code_sort_key(item[0]))
     client_options = {"Todos": None, **{label: code for code, label in clients}}
 
     col1, col2, col3 = st.columns(3)
@@ -59,16 +61,17 @@ try:
     if document_type.strip():
         needle = document_type.strip().lower()
         logs = [log for log in logs if needle in (log.document_type or "").lower()]
+    logs = sorted(logs, key=lambda log: log.created_at or datetime.min, reverse=True)
 
     rows = [
         {
-            "data/hora": log.created_at,
+            "data/hora": format_datetime(log.created_at),
             "usuario": log.user_name,
             "canal origem": log.origin_channel,
             "arquivo original": log.original_filename,
             "novo nome": (log.metadata or {}).get("new_file_name"),
             "cliente": log.client_name,
-            "competencia": log.competence,
+            "competencia": format_competence(log.competence),
             "tipo": log.document_type,
             "status": log.status,
             "mensagem": log.observation,
@@ -77,18 +80,22 @@ try:
         for log in logs
     ]
 
+    st.info(f"{len(rows)} registro(s) encontrado(s).")
     st.dataframe(rows, use_container_width=True, hide_index=True)
-    st.download_button(
-        "Exportar CSV",
-        data=service.to_csv(logs),
-        file_name="historico_documentos.csv",
-        mime="text/csv",
-    )
-    st.download_button(
-        "Exportar TXT",
-        data=service.to_txt(logs),
-        file_name="historico_documentos.txt",
-        mime="text/plain",
-    )
+    export_col1, export_col2 = st.columns(2)
+    with export_col1:
+        st.download_button(
+            "Exportar CSV",
+            data=service.to_csv(logs),
+            file_name="historico_documentos.csv",
+            mime="text/csv",
+        )
+    with export_col2:
+        st.download_button(
+            "Exportar TXT",
+            data=service.to_txt(logs),
+            file_name="historico_documentos.txt",
+            mime="text/plain",
+        )
 except Exception as exc:
-    _show_error("Falha ao carregar historico", exc)
+    _show_error("Nao foi possivel carregar o historico.", exc)
